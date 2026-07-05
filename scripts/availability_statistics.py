@@ -23,11 +23,10 @@ The central conventions are:
 
 A second set of event metrics (frequency, durations, magnitudes) is calculated
 from timestamp-contiguous outage runs. Failure-rate denominators use Service
-Hours (SH). Reserve shutdown hours are not observable in the ENTSO-E outage
-data by default; an optional generation-based approximation can mark long
-no-outage/no-generation runs as economic/reserve shutdown hours (RSH), which
-reduces Service Hours but not Available Hours. Event detection is performed via
-run-length encoding on boolean status series.
+Hours (SH). By default SH follows the legacy available-hours-minus-RSH basis.
+Optionally, SH can be counted directly from actual positive generation hours
+inside the retained unit window. Event detection is performed via run-length
+encoding on boolean status series.
 
 Outputs include:
 1) `make_ieee_tallies(...)`: per-hour per-unit tallies and labels.
@@ -983,6 +982,28 @@ def strip_internal_block_kpi_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=[c for c in df.columns if c in internal_cols], errors="ignore")
 
 
+def fleet_grouping_config(mode: str) -> tuple[list[str], list[str], str]:
+    normalized = str(mode).strip().replace("-", "_").lower()
+    if normalized == "plant_type":
+        return ["country", "plant_type"], ["plant_type"], "plant"
+    if normalized in {"plant_tech", "technology_type"}:
+        return ["country", "plant_tech"], ["plant_tech"], "technology"
+    raise ValueError(f"Unsupported fleet grouping: {mode}")
+
+
+def normalize_group_metadata_labels(meta: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if meta.empty:
+        return meta
+    out = meta.copy()
+    for col in columns:
+        if col not in out.columns:
+            continue
+        text = out[col].astype("string").str.strip()
+        missing = text.isna() | text.isin({"", "nan", "none", "null", "na", "n/a"})
+        out[col] = text.mask(missing, "Unknown")
+    return out
+
+
 def build_block_unit_metadata(tallies: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
     columns = [c for c in columns if c in tallies.columns and c not in BLOCK_UNIT_KEYS]
     key_cols = [c for c in BLOCK_UNIT_KEYS if c in tallies.columns]
@@ -1446,7 +1467,7 @@ def read_positive_unit_generation_hours_for_windows(
         try:
             schema_names = set(pq.read_schema(path).names)
         except Exception as exc:
-            _log(f"[economic-shutdown] skipping unreadable schema {path.name}: {exc}", verbose=verbose)
+            _log(f"[positive-generation] skipping unreadable schema {path.name}: {exc}", verbose=verbose)
             continue
 
         if {"timestamp", "eic_code", "actual_generation_mw"}.issubset(schema_names):
@@ -1468,12 +1489,12 @@ def read_positive_unit_generation_hours_for_windows(
         else:
             continue
 
-        _log(f"[economic-shutdown] reading generation {idx} {path.name}", verbose=verbose)
+        _log(f"[positive-generation] reading generation {idx} {path.name}", verbose=verbose)
         try:
             df = pd.read_parquet(path, columns=cols, filters=filters)
         except Exception as exc:
             _log(
-                f"[economic-shutdown] filtered read failed for {path.name}: {exc}; falling back to column read",
+                f"[positive-generation] filtered read failed for {path.name}: {exc}; falling back to column read",
                 verbose=verbose,
             )
             df = pd.read_parquet(path, columns=cols)
@@ -1509,6 +1530,89 @@ def read_positive_unit_generation_hours_for_windows(
           .sort_values(columns_out, kind="mergesort")
           .reset_index(drop=True)
     )
+
+
+def apply_generation_service_hours(
+    tallies: pd.DataFrame,
+    positive_generation_hours: pd.DataFrame,
+    *,
+    group_keys: list[str] | tuple[str, ...] = ("country", "plant_type_code", "plant_type", "eic_code", "unit_name"),
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Mark Service Hours from actual generation.
+
+    GSH is 1 for retained unit-hours with positive generation and no full
+    outage. Downstream aggregations then use SH=sum(GSH) and define RSH as
+    available hours without generation service.
+    """
+    df = tallies.copy()
+    report_keys = [c for c in group_keys if c in df.columns]
+    if not report_keys and not df.empty:
+        if "eic_code" not in df.columns:
+            raise ValueError("generation service-hour marking needs at least eic_code.")
+        report_keys = ["eic_code"]
+
+    report_columns = [
+        *report_keys,
+        "panel_rows",
+        "active_hours",
+        "available_hours",
+        "service_hours",
+        "reserve_shutdown_hours",
+    ]
+    if df.empty:
+        df["GSH"] = pd.Series(dtype="int8")
+        return df, pd.DataFrame(columns=report_columns)
+
+    df["_service_ts"] = pd.to_datetime(df["timestamp"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+    df["_service_eic"] = df["eic_code"].astype("string").fillna("").str.strip()
+
+    pos = positive_generation_hours.copy() if positive_generation_hours is not None else pd.DataFrame()
+    if pos.empty:
+        has_positive_generation = np.zeros(len(df), dtype=bool)
+    else:
+        pos["eic_code"] = pos["eic_code"].astype("string").fillna("").str.strip()
+        pos["timestamp"] = pd.to_datetime(pos["timestamp"], utc=True, errors="coerce").dt.tz_convert(None).dt.floor("h")
+        pos = pos[pos["eic_code"].ne("") & pos["timestamp"].notna()]
+        if pos.empty:
+            has_positive_generation = np.zeros(len(df), dtype=bool)
+        else:
+            positive_keys = pd.MultiIndex.from_frame(pos[["eic_code", "timestamp"]].drop_duplicates())
+            panel_keys = pd.MultiIndex.from_frame(
+                df[["_service_eic", "_service_ts"]].rename(
+                    columns={"_service_eic": "eic_code", "_service_ts": "timestamp"}
+                )
+            )
+            has_positive_generation = panel_keys.isin(positive_keys)
+
+    is_active = _as_bool_series(df.get("is_active", pd.Series(False, index=df.index))).to_numpy(dtype=bool)
+    strict_oh = np.zeros(len(df), dtype="float64")
+    for col in ["POH", "MOH", "FOH"]:
+        if col in df.columns:
+            strict_oh += pd.to_numeric(df[col], errors="coerce").fillna(0.0).to_numpy(dtype="float64", na_value=0.0)
+    available_mask = is_active & (strict_oh <= 0.0)
+    service_mask = available_mask & has_positive_generation
+    df["GSH"] = service_mask.astype("int8")
+
+    report_base = df[report_keys].copy()
+    report_base["_active"] = is_active.astype("int8")
+    report_base["_available"] = available_mask.astype("int8")
+    report_base["_service"] = df["GSH"].to_numpy(dtype="int8", na_value=0)
+    report = (
+        report_base.groupby(report_keys, dropna=False, sort=False, observed=True)
+        .agg(
+            panel_rows=("_active", "size"),
+            active_hours=("_active", "sum"),
+            available_hours=("_available", "sum"),
+            service_hours=("_service", "sum"),
+        )
+        .reset_index()
+    )
+    report["reserve_shutdown_hours"] = (
+        pd.to_numeric(report["available_hours"], errors="coerce").fillna(0.0)
+        - pd.to_numeric(report["service_hours"], errors="coerce").fillna(0.0)
+    ).clip(lower=0.0)
+    return df.drop(columns=["_service_ts", "_service_eic"], errors="ignore"), report[report_columns]
 
 
 def apply_economic_shutdown_approximation(
@@ -1672,11 +1776,6 @@ def _agg_ieee_factors(g: pd.DataFrame) -> pd.Series:
     EFDH = float(g["EFDH"].sum())
     EUDH = float(g["EUDH"].sum())
     ESDH = float(g["ESDH"].sum())
-    RSH = (
-        float(pd.to_numeric(g["RSH"], errors="coerce").fillna(0.0).sum())
-        if "RSH" in g.columns
-        else 0.0
-    )
 
     # Equivalent hours by class.
     POD_h = POH + EPDH
@@ -1692,12 +1791,21 @@ def _agg_ieee_factors(g: pd.DataFrame) -> pd.Series:
     OH = POH + MOH + FOH
     EOH = OH + EPDH + EMDH + EFDH
 
-    # Economic/reserve shutdown hours are optionally approximated from
-    # no-outage and no-generation runs. They remain available hours, but are
-    # not service hours.
     AH = max(ACTH - OH, 0.0)
     EAH = max(ACTH - EOH, 0.0)
-    SH = max(AH - RSH, 0.0)
+    if "GSH" in g.columns:
+        SH = min(
+            float(pd.to_numeric(g["GSH"], errors="coerce").fillna(0.0).sum()),
+            AH,
+        )
+        RSH = max(AH - SH, 0.0)
+    else:
+        RSH = (
+            float(pd.to_numeric(g["RSH"], errors="coerce").fillna(0.0).sum())
+            if "RSH" in g.columns
+            else 0.0
+        )
+        SH = max(AH - RSH, 0.0)
     ESH = max(EAH - RSH, 0.0)
 
     # Time-based factors (relative to ACTH).
@@ -1737,11 +1845,11 @@ def _agg_ieee_factors(g: pd.DataFrame) -> pd.Series:
     UOR  = _rate(UOH, SH + UOH)
     SOR  = _rate(SOH, SH + SOH)
 
-    EPOR = _rate(POH + EPDH, SH + POH)
-    EMOR = _rate(MOH + EMDH, SH + MOH)
-    EFOR = _rate(FOH + EFDH, SH + FOH)
-    EUOR = _rate(UOH + EUDH, SH + UOH)
-    ESOR = _rate(SOH + ESDH, SH + SOH)
+    EPOR = _rate(POH + EPDH, SH + POH + EPDH)
+    EMOR = _rate(MOH + EMDH, SH + MOH + EMDH)
+    EFOR = _rate(FOH + EFDH, SH + FOH + EFDH)
+    EUOR = _rate(UOH + EUDH, SH + UOH + EUDH)
+    ESOR = _rate(SOH + ESDH, SH + SOH + ESDH)
 
     # ------------------------------------------------------------------
     # Reliability-exposure metrics, including partial events.
@@ -2070,6 +2178,15 @@ def compute_block_kpis(
     EUDH = d["EUDH"].to_numpy(dtype="float64", na_value=0.0)
     ESDH = d["ESDH"].to_numpy(dtype="float64", na_value=0.0)
     RSH = d["RSH"].to_numpy(dtype="float64", na_value=0.0)
+    has_generation_service_hours = "GSH" in d.columns
+    GSH = (
+        pd.to_numeric(d["GSH"], errors="coerce")
+        .fillna(0.0)
+        .clip(lower=0.0, upper=1.0)
+        .to_numpy(dtype="float64", na_value=0.0)
+        if has_generation_service_hours
+        else None
+    )
 
     planned_any = (SOH > 0) | (ESDH > 0)
     reliability_exposure = is_active & ~planned_any
@@ -2093,8 +2210,12 @@ def compute_block_kpis(
     acth_float = acth.astype("float64")
     AH_row = np.clip(acth_float - OH_row, 0.0, None)
     EAH_row = np.clip(acth_float - EOH_row, 0.0, None)
-    RSH_row = np.clip(RSH, 0.0, None)
-    SH_row = np.clip(AH_row - RSH_row, 0.0, None)
+    if has_generation_service_hours and GSH is not None:
+        SH_row = np.minimum(GSH, AH_row)
+        RSH_row = np.clip(AH_row - SH_row, 0.0, None)
+    else:
+        RSH_row = np.clip(RSH, 0.0, None)
+        SH_row = np.clip(AH_row - RSH_row, 0.0, None)
     ESH_row = np.clip(EAH_row - RSH_row, 0.0, None)
 
     weighted_specs = {
@@ -2120,11 +2241,11 @@ def compute_block_kpis(
         "wFOR": (FOH, SH_row + FOH),
         "wUOR": (UOH, SH_row + UOH),
         "wSOR": (SOH, SH_row + SOH),
-        "wEPOR": (POH + EPDH, SH_row + POH),
-        "wEMOR": (MOH + EMDH, SH_row + MOH),
-        "wEFOR": (FOH + EFDH, SH_row + FOH),
-        "wEUOR": (UOH + EUDH, SH_row + UOH),
-        "wESOR": (SOH + ESDH, SH_row + SOH),
+        "wEPOR": (POH + EPDH, SH_row + POH + EPDH),
+        "wEMOR": (MOH + EMDH, SH_row + MOH + EMDH),
+        "wEFOR": (FOH + EFDH, SH_row + FOH + EFDH),
+        "wEUOR": (UOH + EUDH, SH_row + UOH + EUDH),
+        "wESOR": (SOH + ESDH, SH_row + SOH + ESDH),
     }
 
     group_starts = np.empty(len(d), dtype=bool)
@@ -2145,6 +2266,8 @@ def compute_block_kpis(
     }
     for col in HOUR_TALLY_COLS:
         agg_data[col] = _sum_by_group(d[col].to_numpy(dtype="float64", na_value=0.0))
+    if has_generation_service_hours and GSH is not None:
+        agg_data["GSH"] = _sum_by_group(GSH)
 
     for code, status in status_defs.items():
         status_arr = np.asarray(status, dtype=bool)
@@ -2182,7 +2305,14 @@ def compute_block_kpis(
     agg["EOH"] = agg["OH"] + agg["EPDH"] + agg["EMDH"] + agg["EFDH"]
     agg["AH"] = (agg["ACTH"] - agg["OH"]).clip(lower=0.0)
     agg["EAH"] = (agg["ACTH"] - agg["EOH"]).clip(lower=0.0)
-    agg["SH"] = (agg["AH"] - agg["RSH"]).clip(lower=0.0)
+    if has_generation_service_hours and "GSH" in agg.columns:
+        agg["SH"] = np.minimum(
+            pd.to_numeric(agg["GSH"], errors="coerce").fillna(0.0),
+            agg["AH"],
+        )
+        agg["RSH"] = (agg["AH"] - agg["SH"]).clip(lower=0.0)
+    else:
+        agg["SH"] = (agg["AH"] - agg["RSH"]).clip(lower=0.0)
     agg["ESH"] = (agg["EAH"] - agg["RSH"]).clip(lower=0.0)
     agg["D_h"] = agg["SH"]
 
@@ -2210,11 +2340,11 @@ def compute_block_kpis(
             "FOR": _safe_divide(agg["FOH"], agg["SH"] + agg["FOH"]),
             "UOR": _safe_divide(agg["UOH"], agg["SH"] + agg["UOH"]),
             "SOR": _safe_divide(agg["SOH"], agg["SH"] + agg["SOH"]),
-            "EPOR": _safe_divide(agg["POH"] + agg["EPDH"], agg["SH"] + agg["POH"]),
-            "EMOR": _safe_divide(agg["MOH"] + agg["EMDH"], agg["SH"] + agg["MOH"]),
-            "EFOR": _safe_divide(agg["FOH"] + agg["EFDH"], agg["SH"] + agg["FOH"]),
-            "EUOR": _safe_divide(agg["UOH"] + agg["EUDH"], agg["SH"] + agg["UOH"]),
-            "ESOR": _safe_divide(agg["SOH"] + agg["ESDH"], agg["SH"] + agg["SOH"]),
+            "EPOR": _safe_divide(agg["POH"] + agg["EPDH"], agg["SH"] + agg["POH"] + agg["EPDH"]),
+            "EMOR": _safe_divide(agg["MOH"] + agg["EMDH"], agg["SH"] + agg["MOH"] + agg["EMDH"]),
+            "EFOR": _safe_divide(agg["FOH"] + agg["EFDH"], agg["SH"] + agg["FOH"] + agg["EFDH"]),
+            "EUOR": _safe_divide(agg["UOH"] + agg["EUDH"], agg["SH"] + agg["UOH"] + agg["EUDH"]),
+            "ESOR": _safe_divide(agg["SOH"] + agg["ESDH"], agg["SH"] + agg["SOH"] + agg["ESDH"]),
         },
         index=agg.index,
     )
@@ -2380,11 +2510,11 @@ def capacity_weighted_ieee_factors(
             "uFOR": _safe_divide(gp["FOH"], gp["SH"] + gp["FOH"]),
             "uSOR": _safe_divide(gp["SOH"], gp["SH"] + gp["SOH"]),
             "uUOR": _safe_divide(gp["UOH"], gp["SH"] + gp["UOH"]),
-            "uEPOR": _safe_divide(gp["POH"] + gp["EPDH"], gp["SH"] + gp["POH"]),
-            "uEMOR": _safe_divide(gp["MOH"] + gp["EMDH"], gp["SH"] + gp["MOH"]),
-            "uEFOR": _safe_divide(gp["FOH"] + gp["EFDH"], gp["SH"] + gp["FOH"]),
-            "uESOR": _safe_divide(gp["SOH"] + gp["ESDH"], gp["SH"] + gp["SOH"]),
-            "uEUOR": _safe_divide(gp["UOH"] + gp["EUDH"], gp["SH"] + gp["UOH"]),
+            "uEPOR": _safe_divide(gp["POH"] + gp["EPDH"], gp["SH"] + gp["POH"] + gp["EPDH"]),
+            "uEMOR": _safe_divide(gp["MOH"] + gp["EMDH"], gp["SH"] + gp["MOH"] + gp["EMDH"]),
+            "uEFOR": _safe_divide(gp["FOH"] + gp["EFDH"], gp["SH"] + gp["FOH"] + gp["EFDH"]),
+            "uESOR": _safe_divide(gp["SOH"] + gp["ESDH"], gp["SH"] + gp["SOH"] + gp["ESDH"]),
+            "uEUOR": _safe_divide(gp["UOH"] + gp["EUDH"], gp["SH"] + gp["UOH"] + gp["EUDH"]),
         },
         index=gp.index,
     )
@@ -3263,7 +3393,7 @@ def read_inverse_correction_blocks(
     columns: list[str] | None = None,
 ) -> pd.DataFrame:
     """
-    Read inverse-availability correction masks written by validate_outage_statistics.
+    Read inverse-availability correction masks written by validate_availability_statistics.
 
     The correction blocks contain unit-hour flags where inverse validation found
     that the reported outage should be removed/ignored for KPI construction.
@@ -3982,7 +4112,7 @@ def _parse_args() -> argparse.Namespace:
         help=(
             "Minimum actual generation as share of installed capacity treated "
             "as positive generation for generation-based windows, filters, and "
-            "economic-shutdown detection. Example: 0.1 means 10 percent of installed "
+            "service-hour detection. Example: 0.1 means 10 percent of installed "
             "capacity. The old --first-generation-min-mw spelling is accepted "
             "as an alias but now uses the same relative semantics."
         ),
@@ -4023,6 +4153,27 @@ def _parse_args() -> argparse.Namespace:
             "no-outage, no-positive-generation runs with at least this many "
             "hours inside the selected unit counting window. Disabled when omitted; "
             "typical values are 8 or 12."
+        ),
+    )
+    parser.add_argument(
+        "--use-service-hours",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Use actual positive generation hours inside the retained unit window "
+            "as Service Hours. When disabled, Service Hours use the legacy "
+            "available-hours-minus-RSH basis."
+        ),
+    )
+    parser.add_argument(
+        "--fleet-grouping",
+        choices=["plant_type", "plant_tech", "plant-type", "technology-type"],
+        default="plant_type",
+        help=(
+            "Grouping used for the final capacity-weighted fleet KPI tables. "
+            "'plant_type' writes kpis_plant_* by country and plant_type; "
+            "'plant_tech' writes kpis_technology_* by country and plant_tech. "
+            "Hyphenated legacy aliases are accepted."
         ),
     )
     parser.add_argument(
@@ -4076,6 +4227,7 @@ if __name__ == "__main__":
         needs_generation_boundaries
         or args.min_generation_frequency_per_year is not None
         or args.economic_shutdown_min_hours is not None
+        or args.use_service_hours
     )
     if needs_generation_data:
         _log(f"[config] unit_generation_parquet_root={args.unit_generation_parquet_root}", verbose=VERBOSE)
@@ -4096,7 +4248,11 @@ if __name__ == "__main__":
     if args.economic_shutdown_min_hours is not None:
         if args.economic_shutdown_min_hours <= 0:
             raise SystemExit("--economic-shutdown-min-hours must be > 0.")
+        if args.use_service_hours:
+            raise SystemExit("--use-service-hours and --economic-shutdown-min-hours are mutually exclusive.")
         _log(f"[config] economic_shutdown_min_hours={args.economic_shutdown_min_hours}", verbose=VERBOSE)
+    _log(f"[config] use_service_hours={args.use_service_hours}", verbose=VERBOSE)
+    _log(f"[config] fleet_grouping={args.fleet_grouping}", verbose=VERBOSE)
     _log(f"[config] parallel={args.parallel} n_jobs={N_JOBS}", verbose=VERBOSE)
 
     SIZE_BINS = [0, 300, 600, np.inf]
@@ -4292,6 +4448,36 @@ if __name__ == "__main__":
             f"[economic-shutdown] flagged runs={len(economic_shutdown_report):,}; RSH={shutdown_hours:,} h",
             verbose=VERBOSE,
         )
+    if args.use_service_hours:
+        _log("[service-hours] scanning positive generation inside retained unit windows", verbose=VERBOSE)
+        service_windows = unit_windows_from_tallies(tallies)
+        positive_generation_hours = read_positive_unit_generation_hours_for_windows(
+            args.unit_generation_parquet_root,
+            windows=service_windows,
+            unit_capacity_lookup=_unit_capacity_lookup(tallies),
+            min_generation_capacity_share=args.first_generation_min_capacity_share,
+            verbose=VERBOSE,
+        )
+        tallies, service_hours_report = apply_generation_service_hours(
+            tallies,
+            positive_generation_hours,
+        )
+        write_csv(
+            service_hours_report,
+            Path(OUT_DIR, "generation_service_hours_report.csv"),
+            index=False,
+            sep=";",
+        )
+        service_hours = int(pd.to_numeric(tallies["GSH"], errors="coerce").fillna(0).sum())
+        reserve_hours = int(
+            pd.to_numeric(service_hours_report["reserve_shutdown_hours"], errors="coerce")
+            .fillna(0)
+            .sum()
+        ) if not service_hours_report.empty else 0
+        _log(
+            f"[service-hours] service_hours={service_hours:,}; reserve_shutdown_hours={reserve_hours:,}",
+            verbose=VERBOSE,
+        )
     if args.unit_counting_window != "full":
         write_csv(
             unit_counting_window_report,
@@ -4365,9 +4551,16 @@ if __name__ == "__main__":
     _log(f"[done] preprocessing pipeline finished in {time.perf_counter() - started_total:.1f}s", verbose=VERBOSE)
 
     ### Capacity-weighted aggregations
-    unit_meta = build_block_unit_metadata(tallies_cat, ["plant_type"])
+    fleet_group, fleet_meta_cols, fleet_output_stem = fleet_grouping_config(args.fleet_grouping)
+    unit_meta = normalize_group_metadata_labels(
+        build_block_unit_metadata(tallies_cat, fleet_meta_cols),
+        fleet_meta_cols,
+    )
 
-    ## Fuel
+    _log(
+        f"[aggregate] fleet_grouping={args.fleet_grouping}; group={fleet_group}",
+        verbose=VERBOSE,
+    )
     _log("[aggregate] computing block KPIs period=MOY", verbose=VERBOSE)
     block_moy = compute_block_kpis_partitioned(
         tallies_cat,
@@ -4377,12 +4570,12 @@ if __name__ == "__main__":
     )
     fuel_MOY = capacity_weighted_kpis_unified(
         None,
-        group=["country", "plant_type"],
+        group=fleet_group,
         period="MOY",
         block_kpis=block_moy,
         unit_meta=unit_meta,
     )
-    write_table(fuel_MOY, OUT_DIR, "kpis_plant_MOY", to_parquet=False, to_csv=True)
+    write_table(fuel_MOY, OUT_DIR, f"kpis_{fleet_output_stem}_MOY", to_parquet=False, to_csv=True)
     del fuel_MOY, block_moy
     gc.collect()
 
@@ -4395,12 +4588,12 @@ if __name__ == "__main__":
     )
     fuel_Y = capacity_weighted_kpis_unified(
         None,
-        group=["country", "plant_type"],
+        group=fleet_group,
         period="Y",
         block_kpis=block_y,
         unit_meta=unit_meta,
     )
-    write_table(fuel_Y,   OUT_DIR, "kpis_plant_Y",   to_parquet=False, to_csv=True)
+    write_table(fuel_Y, OUT_DIR, f"kpis_{fleet_output_stem}_Y", to_parquet=False, to_csv=True)
     del fuel_Y, block_y
     gc.collect()
 
@@ -4413,12 +4606,12 @@ if __name__ == "__main__":
     )
     fuel_ALL = capacity_weighted_kpis_unified(
         None,
-        group=["country", "plant_type"],
+        group=fleet_group,
         period="overall",
         block_kpis=block_overall,
         unit_meta=unit_meta,
     )
-    write_table(fuel_ALL, OUT_DIR, "kpis_plant_ALL", to_parquet=False, to_csv=True)
+    write_table(fuel_ALL, OUT_DIR, f"kpis_{fleet_output_stem}_ALL", to_parquet=False, to_csv=True)
     del fuel_ALL
     gc.collect()
 
