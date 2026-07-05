@@ -278,10 +278,3 @@ This is not automatically an error. Outage windows and deration windows are hand
 
 Very long runtime  
 Start with `--list-partitions`, country/partition filters, and moderate `--partition-jobs`. Very high `--n-jobs` or `--unit-jobs` values can be slower because of memory and I/O pressure.
-
-## 9. What Not to Commit
-
-- ENTSO-E API tokens.
-- Raw data bundles.
-- Large output, block, parquet, and figure folders if they are reproducible.
-- Local cache folders.
